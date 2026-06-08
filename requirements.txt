@@ -1,7 +1,7 @@
-streamlit
-openai
-python-docx
-PyPDF2
-fpdf2
-markdown
-pandas
+streamlit>=1.30.0
+pandas>=2.0.0
+openpyxl>=3.1.2
+networkx>=3.1
+plotly>=5.18.0
+numpy>=1.24.0
+xlsxwriter>=3.1.0
