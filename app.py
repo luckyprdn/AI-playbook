@@ -6,19 +6,20 @@ import networkx as nx
 import plotly.graph_objects as go
 from datetime import datetime
 import re
-from typing import Tuple, Optional
+import math
+import zipfile
+from typing import Tuple
 
 # ==========================================
 # 1. PAGE CONFIGURATION & SETUP
 # ==========================================
 st.set_page_config(
-    page_title="Jira Import CSV Maker",
-    page_icon="🧊",
+    page_title="Jira Import CSV Maker 2.0",
+    page_icon="🚀",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Standard Jira Fields for Mapping
 JIRA_STANDARD_FIELDS = [
     "Issue ID", "Summary", "Description", "Issue Type", "Parent", 
     "Parent Link", "Epic Link", "Epic Name", "Assignee", "Reporter", 
@@ -31,7 +32,6 @@ JIRA_STANDARD_FIELDS = [
 
 @st.cache_data
 def get_template(template_name: str) -> pd.DataFrame:
-    """Generate smart templates based on enterprise use cases."""
     templates = {
         "Agile Scrum": pd.DataFrame({
             "Summary": ["Login Page", "Backend API", "Setup DB"],
@@ -54,107 +54,103 @@ def get_template(template_name: str) -> pd.DataFrame:
     }
     return templates.get(template_name, pd.DataFrame())
 
-def clean_text_field(text, is_summary=False):
-    """Clean string data, remove newlines safely (Critical for Jira Summary)."""
-    if pd.isna(text):
-        return text
-    text = str(text).strip()
-    if is_summary:
-        # Jira summaries CANNOT have newlines
-        text = re.sub(r'[\r\n]+', ' ', text)
-        text = re.sub(r'\s{2,}', ' ', text)
-        return text[:255] # Jira Summary max 255 chars
-    return text
+def fix_jira_summary(row):
+    """Membersihkan newline dan melimitasi panjang Summary max 255 karakter."""
+    summary = str(row.get('Summary', ''))
+    desc = str(row.get('Description', '')) if pd.notnull(row.get('Description')) else ""
+    
+    if summary == 'nan' or not summary:
+        return row
+
+    # Hapus newline dan whitespace berlebih
+    summary = summary.replace('\n', ' ').replace('\r', ' ').strip()
+    summary = " ".join(summary.split())
+    
+    # Limitasi 255 karakter
+    if len(summary) > 255:
+        new_desc = f"Original Summary:\n{summary}\n\nDescription:\n{desc}"
+        new_summary = summary[:252] + "..."
+        row['Summary'] = new_summary
+        row['Description'] = new_desc
+    else:
+        row['Summary'] = summary
+        row['Description'] = desc
+        
+    return row
 
 @st.cache_data
 def process_cleaning(df: pd.DataFrame, default_priority: str) -> pd.DataFrame:
-    """Vectorized cleaning operations for performance."""
     df_clean = df.copy()
     
-    # Clean String Columns
-    for col in df_clean.select_dtypes(include=['object']):
-        is_summ = 'summary' in col.lower()
-        df_clean[col] = df_clean[col].apply(lambda x: clean_text_field(x, is_summary=is_summ))
+    # Terapkan pembersihan khusus Jira pada Summary
+    if 'Summary' in df_clean.columns:
+        df_clean = df_clean.apply(fix_jira_summary, axis=1)
         
-    # Date formatting
+    # Format tanggal otomatis ke standar Jira (YYYY-MM-DD)
     date_cols = [c for c in df_clean.columns if 'date' in c.lower()]
     for col in date_cols:
         df_clean[col] = pd.to_datetime(df_clean[col], errors='coerce').dt.strftime('%Y-%m-%d')
         
-    # Fill default priority
+    # Default priority
     if 'Priority' in df_clean.columns:
         df_clean['Priority'] = df_clean['Priority'].replace('', np.nan).fillna(default_priority)
         
     return df_clean
 
 def generate_hierarchy_ids(df: pd.DataFrame) -> Tuple[pd.DataFrame, list]:
-    """Generate TEMP-X IDs and map Parent/Epic Links."""
     df_hier = df.copy()
     errors = []
     
-    # 1. Generate Issue ID if not exists
     if 'Issue ID' not in df_hier.columns or df_hier['Issue ID'].isnull().all():
         df_hier['Issue ID'] = [f"TEMP-{i+1}" for i in range(len(df_hier))]
         
-    # Ensure Issue Type exists
     if 'Issue Type' not in df_hier.columns:
-        errors.append("Column 'Issue Type' is missing. Cannot build hierarchy.")
+        errors.append("Kolom 'Issue Type' tidak ditemukan. Tidak dapat membangun hierarki.")
         return df_hier, errors
 
     df_hier['Issue Type'] = df_hier['Issue Type'].astype(str).str.title().str.strip()
 
-    # Create mapping from Summary/Ref to ID
-    # Assumes user provided a 'Parent Ref' column during mapping
     if 'Parent Ref' in df_hier.columns:
         ref_dict = dict(zip(df_hier['Summary'], df_hier['Issue ID']))
         
-        # Map parents
         def find_parent_id(ref):
             if pd.isna(ref) or ref == "": return ""
             return ref_dict.get(ref, "")
             
         df_hier['Mapped Parent ID'] = df_hier['Parent Ref'].apply(find_parent_id)
 
-        # Distribute to Epic Link or Parent based on Jira logic
         df_hier['Epic Link'] = np.where(df_hier['Issue Type'] == 'Story', df_hier['Mapped Parent ID'], "")
         df_hier['Parent'] = np.where(df_hier['Issue Type'].isin(['Task', 'Sub-Task', 'Subtask']), df_hier['Mapped Parent ID'], "")
         
-        # Validation checks
         missing_parents = df_hier[(df_hier['Parent Ref'] != "") & (df_hier['Mapped Parent ID'] == "")]
         if not missing_parents.empty:
-            errors.append(f"Found {len(missing_parents)} issues with unresolved Parent Refs.")
+            errors.append(f"Ditemukan {len(missing_parents)} isu dengan Parent Ref yang tidak valid.")
             
         subtasks_no_parent = df_hier[(df_hier['Issue Type'].isin(['Sub-Task', 'Subtask'])) & (df_hier['Parent'] == "")]
         if not subtasks_no_parent.empty:
-            errors.append(f"Critical: {len(subtasks_no_parent)} Sub-tasks are missing a Parent ID.")
+            errors.append(f"Kritis: {len(subtasks_no_parent)} Sub-task tidak memiliki Parent ID.")
             
     return df_hier, errors
 
 def build_network_graph(df: pd.DataFrame):
-    """Build Plotly visualization from NetworkX graph."""
     if 'Issue ID' not in df.columns or ('Parent' not in df.columns and 'Epic Link' not in df.columns):
         return None
         
     G = nx.DiGraph()
-    
     for _, row in df.iterrows():
         node_id = row.get('Issue ID')
         node_label = str(row.get('Summary'))[:30] + '...' if len(str(row.get('Summary'))) > 30 else str(row.get('Summary'))
         issue_type = str(row.get('Issue Type', 'Task'))
         
         G.add_node(node_id, label=node_label, type=issue_type)
-        
         parent = row.get('Parent', '')
         epic_link = row.get('Epic Link', '')
         
-        if parent:
-            G.add_edge(parent, node_id)
-        elif epic_link:
-            G.add_edge(epic_link, node_id)
+        if parent: G.add_edge(parent, node_id)
+        elif epic_link: G.add_edge(epic_link, node_id)
             
-    # Layout and Plotly setup (limit nodes for performance)
     if G.number_of_nodes() > 500:
-        st.warning("Visualisasi dinonaktifkan: Hierarki lebih dari 500 nodes (Memory Optimization).")
+        st.warning("Visualisasi dinonaktifkan: Hierarki melebihi 500 nodes (Optimalisasi Memori).")
         return None
         
     pos = nx.spring_layout(G, seed=42)
@@ -171,7 +167,6 @@ def build_network_graph(df: pd.DataFrame):
     node_y = [pos[node][1] for node in G.nodes()]
     node_text = [f"ID: {node}<br>Type: {G.nodes[node].get('type')}<br>Sum: {G.nodes[node].get('label')}" for node in G.nodes()]
     
-    # Colors based on type
     color_map = {'Epic': '#6554C0', 'Story': '#36B37E', 'Task': '#4C9AFF', 'Sub-Task': '#FFAB00', 'Subtask': '#FFAB00'}
     node_colors = [color_map.get(G.nodes[node].get('type'), '#888') for node in G.nodes()]
     
@@ -182,11 +177,9 @@ def build_network_graph(df: pd.DataFrame):
 
     fig = go.Figure(data=[edge_trace, node_trace],
              layout=go.Layout(
-                showlegend=False, hovermode='closest',
-                margin=dict(b=0,l=0,r=0,t=0),
+                showlegend=False, hovermode='closest', margin=dict(b=0,l=0,r=0,t=0),
                 xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-                yaxis=dict(showgrid=False, zeroline=False, showticklabels=False))
-                )
+                yaxis=dict(showgrid=False, zeroline=False, showticklabels=False)))
     return fig
 
 # ==========================================
@@ -194,236 +187,171 @@ def build_network_graph(df: pd.DataFrame):
 # ==========================================
 
 def main():
-    st.title("🚀 Jira Import CSV Maker (Enterprise Edition)")
-    st.markdown("Alat komprehensif untuk membersihkan, menstrukturisasi hierarki, dan menghasilkan CSV yang siap diimpor ke Jira Cloud & Data Center.")
+    st.title("🚀 Jira Import CSV Maker 2.0")
+    st.markdown("Automasi penuh untuk **Multi-sheet Excel**, **Smart String Cleaning**, dan **Chunked CSV Export**.")
 
-    # Initialize Session State
-    if 'raw_data' not in st.session_state:
-        st.session_state.raw_data = None
-    if 'mapped_data' not in st.session_state:
-        st.session_state.mapped_data = None
-    if 'final_data' not in st.session_state:
-        st.session_state.final_data = None
+    if 'raw_data' not in st.session_state: st.session_state.raw_data = None
+    if 'mapped_data' not in st.session_state: st.session_state.mapped_data = None
+    if 'final_data' not in st.session_state: st.session_state.final_data = None
 
-    # Sidebar
     with st.sidebar:
-        st.header("⚙️ Konfigurasi Export")
-        st.info("Konfigurasi ini akan diaplikasikan pada file hasil export akhir.")
-        export_encoding = st.selectbox("CSV Encoding", ["ISO-8859-1", "UTF-8", "UTF-8-SIG"], index=0, 
-                                     help="Jira Server/DC terkadang memerlukan ISO-8859-1. Cloud aman dengan UTF-8.")
+        st.header("⚙️ Konfigurasi Global")
+        export_encoding = st.selectbox("CSV Encoding", ["UTF-8", "ISO-8859-1", "UTF-8-SIG"], index=0)
         export_delimiter = st.selectbox("CSV Delimiter", [",", ";", "|"], index=0)
         default_priority = st.selectbox("Default Priority", ["Medium", "High", "Low", "Highest", "Lowest"])
+        max_rows_per_file = st.number_input("Maksimal Baris per CSV (Jira Limit)", min_value=50, max_value=1000, value=250, step=50)
         
         st.divider()
-        st.markdown("**Statistik Global**")
         if st.session_state.final_data is not None:
             df_stat = st.session_state.final_data
+            st.markdown("**📊 Statistik Data**")
             st.metric("Total Issues", len(df_stat))
             if 'Issue Type' in df_stat.columns:
-                types = df_stat['Issue Type'].value_counts()
-                st.caption("Breakdown:")
-                for t, c in types.items():
+                for t, c in df_stat['Issue Type'].value_counts().items():
                     st.text(f"- {t}: {c}")
 
-    # Tabs Configuration
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "1. Upload & Templates", 
-        "2. Mapping Kolom", 
-        "3. Editor & Hierarki", 
-        "4. Visualisasi Dependency", 
-        "5. Validasi & Export"
+        "1. Upload & Ekstraksi", "2. Mapping Kolom", "3. Editor & Hierarki", "4. Visualisasi", "5. Validasi & Export"
     ])
 
-    # ------------------------------------------
-    # TAB 1: UPLOAD & TEMPLATES
-    # ------------------------------------------
+    # --- TAB 1: UPLOAD ---
     with tab1:
         colA, colB = st.columns([1, 1])
         with colA:
-            st.subheader("Template Bawaan")
-            selected_template = st.selectbox("Pilih Template Kasus Uji", ["Pilih Template...", "Agile Scrum", "COBIT Import", "ISO 27001 CAPA"])
+            st.subheader("Template CSV")
+            selected_template = st.selectbox("Pilih Template Uji Coba", ["Pilih Template...", "Agile Scrum", "COBIT Import", "ISO 27001 CAPA"])
             if selected_template != "Pilih Template...":
                 tpl_df = get_template(selected_template)
                 st.dataframe(tpl_df, use_container_width=True)
-                csv_tpl = tpl_df.to_csv(index=False).encode('utf-8')
-                st.download_button(label="📥 Download Template CSV", data=csv_tpl, file_name=f"Template_{selected_template}.csv", mime='text/csv')
+                st.download_button("📥 Download Template", tpl_df.to_csv(index=False).encode('utf-8'), f"Template_{selected_template}.csv", 'text/csv')
 
         with colB:
-            st.subheader("Upload Data (Excel/CSV)")
-            uploaded_file = st.file_uploader("Pilih file sumber Anda", type=['csv', 'xlsx', 'xls'])
+            st.subheader("Upload Excel / CSV")
+            uploaded_file = st.file_uploader("Upload file sumber", type=['csv', 'xlsx', 'xls'])
             if uploaded_file is not None:
                 try:
                     if uploaded_file.name.endswith('.csv'):
-                        # Coba baca dengan beberapa encoding dan separator lazim
-                        try:
-                            df_raw = pd.read_csv(uploaded_file, encoding='utf-8')
-                        except UnicodeDecodeError:
-                            uploaded_file.seek(0)
-                            df_raw = pd.read_csv(uploaded_file, encoding='ISO-8859-1', sep=None, engine='python')
+                        df_raw = pd.read_csv(uploaded_file, encoding='ISO-8859-1', sep=None, engine='python')
                     else:
-                        df_raw = pd.read_excel(uploaded_file)
+                        all_sheets_dict = pd.read_excel(uploaded_file, sheet_name=None)
+                        if len(all_sheets_dict) > 1:
+                            st.info(f"Terdeteksi {len(all_sheets_dict)} sheet. Seluruh sheet otomatis digabung.")
                         
+                        df_list = []
+                        for sheet_name, df_sheet in all_sheets_dict.items():
+                            df_sheet['Source Sheet'] = sheet_name
+                            df_list.append(df_sheet)
+                        df_raw = pd.concat(df_list, ignore_index=True)
+                        
+                    # Drop baris yang sepenuhnya kosong
+                    df_raw.dropna(how='all', inplace=True)
                     st.session_state.raw_data = df_raw
-                    st.success(f"File berhasil dimuat! Total: {len(df_raw)} baris.")
+                    st.success(f"Data berhasil diekstraksi! Total baris: {len(df_raw)}.")
                     st.dataframe(df_raw.head(5), use_container_width=True)
                 except Exception as e:
-                    st.error(f"Gagal membaca file: {e}")
+                    st.error(f"Gagal memproses file: {e}")
 
-    # ------------------------------------------
-    # TAB 2: COLUMN MAPPING
-    # ------------------------------------------
+    # --- TAB 2: MAPPING ---
     with tab2:
-        st.subheader("Engine Mapping Kolom")
         if st.session_state.raw_data is not None:
+            st.subheader("Pemetaan Kolom")
             df_raw = st.session_state.raw_data
-            raw_cols = ["<Abaikan Kolom Ini>"] + list(df_raw.columns)
-            
-            st.info("Petakan kolom dari file asli Anda ke field standar Jira. Biarkan '<Abaikan Kolom Ini>' jika tidak ingin diimpor.")
+            raw_cols = ["<Abaikan>"] + list(df_raw.columns)
             
             mapping_dict = {}
             cols = st.columns(3)
             
-            # Auto-mapping logic sederhana
-            for i, standard_field in enumerate(JIRA_STANDARD_FIELDS + ["Parent Ref"]):
+            for i, standard_field in enumerate(JIRA_STANDARD_FIELDS + ["Parent Ref", "Source Sheet"]):
                 default_idx = 0
                 for j, rc in enumerate(raw_cols):
                     if standard_field.lower() in rc.lower():
                         default_idx = j
                         break
-                        
                 with cols[i % 3]:
-                    mapped_val = st.selectbox(f"Field Jira: {standard_field}", raw_cols, index=default_idx, key=f"map_{standard_field}")
-                    if mapped_val != "<Abaikan Kolom Ini>":
+                    mapped_val = st.selectbox(f"Jira: {standard_field}", raw_cols, index=default_idx, key=f"map_{standard_field}")
+                    if mapped_val != "<Abaikan>":
                         mapping_dict[standard_field] = mapped_val
 
-            if st.button("🚀 Terapkan Mapping & Pembersihan Otomatis"):
-                with st.spinner("Memproses data..."):
+            if st.button("🚀 Mapping & Bersihkan Data"):
+                with st.spinner("Membersihkan newline dan karakter ilegal..."):
                     df_mapped = pd.DataFrame()
                     for std_field, raw_field in mapping_dict.items():
                         df_mapped[std_field] = df_raw[raw_field]
                         
-                    # Eksekusi advanced cleaning
                     df_cleaned = process_cleaning(df_mapped, default_priority)
                     st.session_state.mapped_data = df_cleaned
-                    st.success("Mapping dan Data Cleaning berhasil!")
+                    st.success("Data berhasil dipetakan dan dibersihkan secara otomatis!")
         else:
-            st.warning("Silakan upload data di Tab 1 terlebih dahulu.")
+            st.warning("Upload data di Tab 1.")
 
-    # ------------------------------------------
-    # TAB 3: EDITOR & HIERARCHY
-    # ------------------------------------------
+    # --- TAB 3: EDITOR ---
     with tab3:
         if st.session_state.mapped_data is not None:
-            st.subheader("Dynamic Row Editor & Pembangunan Hierarki")
-            st.markdown("Edit data secara langsung. Pastikan **Issue Type** benar (Epic, Story, Task, Sub-task).")
-            
-            # Interactive data editor (Streamlit optimized)
+            st.subheader("Editor Data Cepat")
             edited_df = st.data_editor(st.session_state.mapped_data, num_rows="dynamic", use_container_width=True)
             
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button("⚡ Generate Auto Issue ID & Hierarki"):
-                    with st.spinner("Menghitung relasi Parent-Child..."):
-                        df_hier, errors = generate_hierarchy_ids(edited_df)
-                        st.session_state.final_data = df_hier
-                        if errors:
-                            for err in errors:
-                                st.warning(err)
-                        else:
-                            st.success("Hierarki berhasil dibangun! Issue ID Sementara (TEMP-X) telah dibuat.")
-            with col2:
-                st.info("Logika Hierarki: Epic ➔ Story ➔ Task ➔ Sub-task.")
-                
-            if st.session_state.final_data is not None:
-                st.write("Preview Data dengan Hierarki:")
-                st.dataframe(st.session_state.final_data, use_container_width=True)
+            if st.button("⚡ Generate ID & Hierarki"):
+                with st.spinner("Menggabungkan relasi Parent-Child..."):
+                    df_hier, errors = generate_hierarchy_ids(edited_df)
+                    st.session_state.final_data = df_hier
+                    if errors:
+                        for err in errors: st.warning(err)
+                    else:
+                        st.success("Hierarki berhasil dibuat!")
         else:
-             st.warning("Silakan selesaikan Mapping di Tab 2.")
+            st.warning("Lakukan mapping di Tab 2.")
 
-    # ------------------------------------------
-    # TAB 4: VISUALIZATION
-    # ------------------------------------------
+    # --- TAB 4: VISUALISASI ---
     with tab4:
-        st.subheader("Network Graph Dependency")
         if st.session_state.final_data is not None:
              fig = build_network_graph(st.session_state.final_data)
-             if fig:
-                 st.plotly_chart(fig, use_container_width=True)
-             else:
-                 st.info("Tidak ada relasi hierarki untuk ditampilkan atau data belum di-generate.")
+             if fig: st.plotly_chart(fig, use_container_width=True)
         else:
-             st.warning("Silakan generate hierarki di Tab 3 terlebih dahulu.")
+             st.info("Selesaikan Tab 3 terlebih dahulu.")
 
-    # ------------------------------------------
-    # TAB 5: VALIDATION & EXPORT
-    # ------------------------------------------
+    # --- TAB 5: EXPORT ---
     with tab5:
-        st.subheader("Pengecekan Akhir & Export Engine")
         if st.session_state.final_data is not None:
+            st.subheader("Finalisasi & Export")
             df_export = st.session_state.final_data.copy()
-            
-            # Cleaning kolom bantuan (seperti Parent Ref atau Mapped Parent ID)
             cols_to_drop = [c for c in ['Parent Ref', 'Mapped Parent ID'] if c in df_export.columns]
             df_export.drop(columns=cols_to_drop, inplace=True, errors='ignore')
             
-            # Validasi akhir Jira compatibility
-            st.markdown("### Laporan Validasi Edge Case Jira")
-            validation_passed = True
-            
-            # Rule 1: Summary maxlength and newline
-            if 'Summary' in df_export.columns:
-                long_sum = df_export['Summary'].str.len() > 255
-                has_nl = df_export['Summary'].astype(str).str.contains(r'[\r\n]')
-                
-                if long_sum.any():
-                    st.error(f"❌ Ditemukan {long_sum.sum()} baris dengan Summary melebihi 255 karakter.")
-                    validation_passed = False
-                if has_nl.any():
-                    st.error(f"❌ Ditemukan {has_nl.sum()} baris dengan karakter newline (Enter) pada Summary.")
-                    validation_passed = False
-                    
-            # Rule 2: Sub-task Parent
-            if 'Issue Type' in df_export.columns and 'Parent' in df_export.columns:
-                orphaned_subtasks = df_export[(df_export['Issue Type'] == 'Sub-task') & (df_export['Parent'] == "")]
-                if not orphaned_subtasks.empty:
-                    st.error(f"❌ Ditemukan {len(orphaned_subtasks)} Sub-task yang tidak memiliki Parent Link/Parent ID.")
-                    validation_passed = False
-                    
-            if validation_passed:
-                st.success("✅ Semua validasi kompatibilitas Jira telah lolos!")
-            else:
-                st.warning("⚠️ Harap perbaiki error di atas melalui Tab 3 (Editor) sebelum Export agar import Jira tidak gagal.")
-            
-            st.divider()
-            st.markdown("### Export Files")
+            # Pengecekan Limitasi
+            st.info(f"Total data: {len(df_export)} baris. Batas maksimum impor Jira adalah {max_rows_per_file} baris per file.")
             
             col_exp1, col_exp2 = st.columns(2)
             
-            # Generate CSV (using User Setting)
-            csv_data = df_export.to_csv(index=False, sep=export_delimiter, encoding=export_encoding)
-            
-            # Generate Excel
+            # Excel Export
             excel_buffer = io.BytesIO()
             with pd.ExcelWriter(excel_buffer, engine='xlsxwriter') as writer:
                 df_export.to_excel(writer, index=False, sheet_name='Jira_Import')
-            excel_data = excel_buffer.getvalue()
             
-            with col_exp1:
-                st.download_button(
-                    label=f"💾 Download CSV Jira ({export_encoding})",
-                    data=csv_data.encode(export_encoding, errors='replace'),
-                    file_name=f"Jira_Import_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                    mime="text/csv"
-                )
             with col_exp2:
-                st.download_button(
-                    label="📊 Download Excel Version",
-                    data=excel_data,
-                    file_name=f"Jira_Import_Backup_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-        else:
-            st.info("Selesaikan semua langkah sebelumnya untuk memunculkan tombol export.")
+                st.download_button("📊 Download Excel Full", excel_buffer.getvalue(), f"Jira_Backup_{datetime.now().strftime('%H%M')}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                
+            # CSV Export Handling (Chunking)
+            if len(df_export) > max_rows_per_file:
+                st.warning("Data melebihi batas impor Jira. Aplikasi telah memecah file Anda menjadi bentuk .ZIP otomatis.")
+                
+                zip_buffer = io.BytesIO()
+                num_chunks = math.ceil(len(df_export) / max_rows_per_file)
+                
+                with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+                    for i in range(num_chunks):
+                        start_idx = i * max_rows_per_file
+                        end_idx = start_idx + max_rows_per_file
+                        chunk_df = df_export.iloc[start_idx:end_idx]
+                        
+                        csv_data = chunk_df.to_csv(index=False, sep=export_delimiter, encoding=export_encoding)
+                        zip_file.writestr(f"Jira_Import_Part_{i+1}.csv", csv_data)
+                        
+                with col_exp1:
+                    st.download_button(f"📦 Download Split CSV ZIP ({num_chunks} files)", zip_buffer.getvalue(), f"Jira_Import_Split_{datetime.now().strftime('%H%M')}.zip", "application/zip")
+            else:
+                csv_data = df_export.to_csv(index=False, sep=export_delimiter, encoding=export_encoding)
+                with col_exp1:
+                    st.download_button(f"💾 Download CSV Jira ({export_encoding})", csv_data.encode(export_encoding, errors='replace'), f"Jira_Import_{datetime.now().strftime('%H%M')}.csv", "text/csv")
 
 if __name__ == "__main__":
     main()
